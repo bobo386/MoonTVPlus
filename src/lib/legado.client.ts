@@ -221,6 +221,26 @@ function splitAlternatives(rule?: string): string[] {
   return (rule || '').split('||').map((item) => item.trim()).filter(Boolean);
 }
 
+function splitRuleFilters(rule: string) {
+  const parts = (rule || '').split('##');
+  return { base: (parts.shift() || '').trim(), filters: parts };
+}
+
+function applyRuleFilters(value: string, filters: string[]) {
+  let result = value;
+  for (let index = 0; index < filters.length; index += 2) {
+    const pattern = filters[index];
+    const replacement = filters[index + 1] ?? '';
+    if (!pattern) continue;
+    try {
+      result = result.replace(new RegExp(pattern, 'g'), replacement);
+    } catch {
+      result = result.split(pattern).join(replacement);
+    }
+  }
+  return result;
+}
+
 function isLegadoAttrToken(value: string) {
   return /^(href|src|title|alt|text|textNodes|html|content|value|data-[\w-]+)$/i.test(value.trim());
 }
@@ -262,7 +282,7 @@ function parseStep(step: string): { selector: string; attr: string } {
 }
 
 function stripFilters(rule: string) {
-  return rule.split('##')[0].trim();
+  return splitRuleFilters(rule).base;
 }
 
 function selectElements($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: string): cheerio.Cheerio<any> {
@@ -301,6 +321,7 @@ function readValue($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>, rule?: str
     else value = node.attr(attr) || '';
     value = he.decode(value || '').replace(/\u00a0/g, ' ').trim();
     if ((normalizedAttr === 'href' || normalizedAttr === 'src') && value && baseUrl) value = normalizeUrl(baseUrl, value);
+    value = applyRuleFilters(value, splitRuleFilters(alternative).filters);
     if (value) return value;
   }
   return '';
@@ -379,6 +400,17 @@ function cleanContent(value: string) {
     .map((line) => line.trim())
     .filter(Boolean)
     .join('\n\n');
+}
+
+function proxyChapterImages(content: string, source: BookSource) {
+  if (!/<img\b/i.test(content)) return content;
+  const rule = source.legado;
+  if (rule?.bookSourceType !== 2 && source.legado?.bookSourceType !== 2) return content;
+  return content.replace(/<img\b([^>]*?)\bsrc=(['"])(.*?)\2([^>]*)>/gi, (match, before, quote, src, after) => {
+    if (!src || src.startsWith('/api/books/image')) return match;
+    const proxied = `/api/books/image?sourceId=${encodeURIComponent(source.id)}&url=${encodeURIComponent(src)}`;
+    return `<img${before}src=${quote}${proxied}${quote}${after}>`;
+  });
 }
 
 async function resolveLegadoConfig(): Promise<ResolvedLegadoConfig> {
@@ -474,7 +506,16 @@ async function fetchText(source: BookSource, url: string): Promise<string> {
       if (!response.ok) throw new Error(`请求失败: ${response.status}`);
       const contentLength = Number(response.headers.get('content-length') || '0');
       if (contentLength > MAX_TEXT_BYTES) throw new Error('响应内容过大');
-      const text = await response.text();
+      const buffer = await response.arrayBuffer();
+      const contentType = response.headers.get('content-type') || '';
+      const charset = contentType.match(/charset=([^;]+)/i)?.[1]?.trim().replace(/^['"]|['"]$/g, '');
+      const decoderName = /gbk|gb2312|gb18030/i.test(charset || '') ? 'gb18030' : (charset || 'utf-8');
+      let text: string;
+      try {
+        text = new TextDecoder(decoderName).decode(buffer);
+      } catch {
+        text = new TextDecoder('utf-8').decode(buffer);
+      }
       if (text.length > MAX_TEXT_BYTES) throw new Error('响应内容过大');
       textCache.set(cacheKey, { data: text, expiresAt: Date.now() + cacheTTL });
       return text;
@@ -880,15 +921,27 @@ export class LegadoClient {
     const cached = chapterCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) return cached.data;
 
-    const html = await fetchText(source, targetUrl);
-    const rawContent = contentFromRule(html, rule.ruleContent.content, targetUrl);
+    let pageUrl = targetUrl;
+    const parts: string[] = [];
+    const visited = new Set<string>();
+    for (let page = 0; page < 8 && pageUrl && !visited.has(pageUrl); page += 1) {
+      visited.add(pageUrl);
+      const html = await fetchText(source, pageUrl);
+      const part = contentFromRule(html, rule.ruleContent.content, pageUrl);
+      if (part) parts.push(part);
+      const next = rule.ruleContent.nextContentUrl ? contentFromRule(html, rule.ruleContent.nextContentUrl, pageUrl) : '';
+      const normalizedNext = next ? normalizeUrl(pageUrl, next) : '';
+      if (!normalizedNext || normalizedNext === pageUrl || visited.has(normalizedNext)) break;
+      pageUrl = normalizedNext;
+    }
+    const rawContent = parts.join('\\n\\n');
     const chapters = tocHref ? await this.getChapters(sourceId, tocHref).catch(() => []) : [];
     const index = chapters.findIndex((item) => item.href === targetUrl || item.href === chapterHref);
     const content: BookChapterContent = {
       id: stableId(`${source.id}|${targetUrl}`),
       title: index >= 0 ? chapters[index].title : '',
       href: targetUrl,
-      content: cleanContent(rawContent),
+      content: proxyChapterImages(cleanContent(rawContent), source),
       previousHref: index > 0 ? chapters[index - 1].href : undefined,
       nextHref: index >= 0 && index + 1 < chapters.length ? chapters[index + 1].href : undefined,
     };

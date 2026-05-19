@@ -48,6 +48,7 @@ export interface LegadoBookSourceRule {
   bookSourceName?: string;
   bookSourceUrl?: string;
   bookSourceGroup?: string;
+  bookSourceType?: number;
   enabled?: boolean;
   enabledExplore?: boolean;
   exploreUrl?: string;
